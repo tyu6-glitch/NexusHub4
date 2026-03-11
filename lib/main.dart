@@ -72,7 +72,9 @@ class _MainScreenState extends State<MainScreen> {
   void dispose() {
     _monitorTimer?.cancel();
     _tcpSocket?.close(); 
-    _serverSocket?.close(); 
+    _serverSocket?.close();
+    _keyboardController.dispose();
+    _keyboardFocus.dispose();
     super.dispose();
   }
 
@@ -107,7 +109,7 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
-  // 🌟 الكود السحري الجديد للاتصال 🌟
+  // 🌟 الكود السحري للاتصال مع تحسينات الأمان 🌟
   Future<void> autoDiscoverPC() async {
     setState(() {
       isScanning = true;
@@ -119,8 +121,8 @@ class _MainScreenState extends State<MainScreen> {
     });
 
     try {
-      _serverSocket?.close();
-      _tcpSocket?.close();
+      await _serverSocket?.close();
+      await _tcpSocket?.close();
 
       // فتح الباب (8080) وانتظار رسالة البايثون
       _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, 8080);
@@ -136,6 +138,7 @@ class _MainScreenState extends State<MainScreen> {
               connected = true;
               String extractedIp = message.split(":")[1].trim();
               
+              if (!mounted) return;
               setState(() {
                 deviceIp = isWifiSelected ? extractedIp : "127.0.0.1";
                 String typeStr = isWifiSelected ? "الواي فاي 📶" : "كيبل الـ USB 🔗";
@@ -148,11 +151,11 @@ class _MainScreenState extends State<MainScreen> {
 
               if (isWifiSelected) {
                 // إذا كنا واي فاي، نغلق بورت الاستماع ونتصل ببورت 8888 للتحكم
-                _serverSocket?.close();
+                await _serverSocket?.close();
                 socket.destroy();
                 await _connectTcp();
               } else {
-                // إذا كنا USB، نحتفظ بهذا الاتصال للأوامر (كما كان كودك القديم)
+                // إذا كنا USB، نحتفظ بهذا الاتصال للأوامر
                 _tcpSocket = socket;
               }
 
@@ -160,7 +163,7 @@ class _MainScreenState extends State<MainScreen> {
             }
           },
           onDone: () {
-            if (!isWifiSelected) {
+            if (!isWifiSelected && mounted) {
               setState(() {
                 connectionStatus = "انقطع الاتصال عبر الـ USB ✗";
                 statusColor = Colors.red;
@@ -174,7 +177,7 @@ class _MainScreenState extends State<MainScreen> {
 
       // مهلة 15 ثانية وتتوقف الدائرة عن الدوران إن لم يتصل الكمبيوتر
       Future.delayed(const Duration(seconds: 15), () {
-        if (isScanning && !connected) {
+        if (isScanning && !connected && mounted) {
           setState(() {
             isScanning = false;
             String typeStr = isWifiSelected ? "الواي فاي" : "كيبل الـ USB";
@@ -187,6 +190,7 @@ class _MainScreenState extends State<MainScreen> {
 
     } catch (e) {
       debugPrint("❌ فشل فتح المنفذ 8080: $e");
+      if (!mounted) return;
       setState(() {
         connectionStatus = "فشل تهيئة الاتصال: $e";
         statusColor = Colors.red;
@@ -202,7 +206,7 @@ class _MainScreenState extends State<MainScreen> {
     _monitorTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
       try {
         final response = await http.get(Uri.parse('http://$deviceIp:5000/get_stats')).timeout(const Duration(seconds: 1));
-        if (response.statusCode == 200) {
+        if (response.statusCode == 200 && mounted) {
           final data = json.decode(response.body);
           setState(() {
             double cpu = double.tryParse(data['cpu']?.toString() ?? '0') ?? 0.0;
@@ -211,7 +215,9 @@ class _MainScreenState extends State<MainScreen> {
             ramUsage = ram.toStringAsFixed(1);
           });
         }
-      } catch (e) {}
+      } catch (e) {
+        // يمكن إضافة debugPrint للخطأ إذا لزم الأمر
+      }
     });
   }
 
@@ -220,11 +226,11 @@ class _MainScreenState extends State<MainScreen> {
   Future<void> syncApps() async {
     if (deviceIp.isEmpty) return; 
     setState(() => isSyncing = true);
+    final httpClient = HttpClient()..connectionTimeout = const Duration(seconds: 15);
     try {
       sendCommand("SYNC");
       await Future.delayed(const Duration(milliseconds: 1000));
       String url = 'http://$deviceIp:5000/get_all_data?t=${DateTime.now().millisecondsSinceEpoch}';
-      final httpClient = HttpClient()..connectionTimeout = const Duration(seconds: 15);
       final request = await httpClient.getUrl(Uri.parse(url));
       final response = await request.close().timeout(const Duration(seconds: 30)); 
 
@@ -233,7 +239,7 @@ class _MainScreenState extends State<MainScreen> {
         final data = json.decode(responseBody);
         String appsRaw = data['apps_raw'] ?? "";
         List<dynamic> icons = data['icons'] ?? [];
-        if (appsRaw.isNotEmpty) {
+        if (appsRaw.isNotEmpty && mounted) {
           List<String> appNames = appsRaw.split('|');
           List<Map<String, String>> fetchedApps = [];
           for (int i = 0; i < appNames.length; i++) {
@@ -250,15 +256,15 @@ class _MainScreenState extends State<MainScreen> {
             }
           }
           setState(() => customApps = fetchedApps);
-        } else {
+        } else if (mounted) {
           setState(() => customApps = []);
         }
       }
-      httpClient.close();
     } catch (e) {
       debugPrint("خطأ المزامنة: $e");
     } finally {
-      setState(() => isSyncing = false);
+      httpClient.close();
+      if (mounted) setState(() => isSyncing = false);
     }
   }
 
