@@ -57,7 +57,7 @@ class _MainScreenState extends State<MainScreen> {
   bool isSyncing = false;
 
   Socket? _tcpSocket;
-  ServerSocket? _serverSocket;
+  RawDatagramSocket? _udpSocket; // 🌟 إضافة مقبس الـ UDP
   bool isIosUsbMode = false; 
 
   Offset? _lastTouchPosition;
@@ -72,21 +72,18 @@ class _MainScreenState extends State<MainScreen> {
   void dispose() {
     _monitorTimer?.cancel();
     _tcpSocket?.close(); 
-    _serverSocket?.close();
-    _keyboardController.dispose();
-    _keyboardFocus.dispose();
+    _udpSocket?.close(); // 🌟 إغلاق مقبس الـ UDP عند الخروج
     super.dispose();
   }
 
   Future<void> _connectTcp() async {
-    if (isIosUsbMode) return; // في وضع الـ USB نستخدم اتصال 8080 للأوامر
+    if (isIosUsbMode) return; 
 
     _tcpSocket?.close();
     if (deviceIp.isEmpty) return;
     try {
       _tcpSocket = await Socket.connect(deviceIp, 8888, timeout: const Duration(seconds: 2));
       _tcpSocket?.setOption(SocketOption.tcpNoDelay, true);
-      debugPrint("✅ تم الاتصال ببورت التحكم 8888");
     } catch (e) {
       debugPrint("خطأ في اتصال TCP: $e");
     }
@@ -109,90 +106,78 @@ class _MainScreenState extends State<MainScreen> {
     }
   }
 
-  // 🌟 الكود السحري للاتصال مع تحسينات الأمان 🌟
+  // 🌟 دالة مساعدة لترتيب حالة النجاح وتفادي تكرار الكود
+  void _setConnectionSuccess(String ip, String connectionType) async {
+    setState(() {
+      deviceIp = ip;
+      connectionStatus = "تم الاتصال بنجاح عبر $connectionType ✓";
+      statusColor = Colors.green;
+      isScanning = false;
+    });
+    startMonitor();
+    await _connectTcp();
+  }
+
+  // 🌟 التعديل الجذري هنا: الاستماع لـ UDP بدل البحث العشوائي
   Future<void> autoDiscoverPC() async {
     setState(() {
       isScanning = true;
       deviceIp = ""; 
-      isIosUsbMode = !isWifiSelected;
+      isIosUsbMode = false; // تم توحيد الاتصال الآن فلا نحتاج لوضع الآيفون المعقد
       String typeStr = isWifiSelected ? "الواي فاي 📶" : "كيبل الـ USB 🔗";
-      connectionStatus = "جاري انتظار الكمبيوتر عبر $typeStr ⏳...";
+      connectionStatus = "جاري البحث عن الكمبيوتر عبر $typeStr ⏳...";
       statusColor = Colors.orange;
     });
 
+    _udpSocket?.close();
+    bool isFound = false;
+
+    // 1. الفحص السريع عبر Localhost (لبعض حالات الأندرويد عبر ADB)
+    if (!isWifiSelected) {
+      try {
+        final response = await http.get(Uri.parse('http://127.0.0.1:5000/get_stats')).timeout(const Duration(milliseconds: 1000));
+        if (response.statusCode == 200) {
+          _setConnectionSuccess('127.0.0.1', "كيبل الـ USB (مباشر)");
+          return;
+        }
+      } catch (_) {}
+    }
+
+    // 2. الاستماع لبث البايثون (UDP Broadcast) على البورت 5555
     try {
-      await _serverSocket?.close();
-      await _tcpSocket?.close();
+      _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 5555);
+      _udpSocket!.broadcastEnabled = true;
 
-      // فتح الباب (8080) وانتظار رسالة البايثون
-      _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, 8080);
-      debugPrint("📱 الجوال ينتظر اتصال الكمبيوتر على المنفذ 8080...");
-
-      bool connected = false;
-
-      _serverSocket!.listen((Socket socket) {
-        socket.listen(
-          (List<int> data) async {
-            String message = utf8.decode(data).trim();
-            if (message.startsWith("PC_IP:")) {
-              connected = true;
-              String extractedIp = message.split(":")[1].trim();
-              
-              if (!mounted) return;
-              setState(() {
-                deviceIp = isWifiSelected ? extractedIp : "127.0.0.1";
-                String typeStr = isWifiSelected ? "الواي فاي 📶" : "كيبل الـ USB 🔗";
-                connectionStatus = "تم الاتصال بنجاح عبر $typeStr ✓";
-                statusColor = Colors.green;
-                isScanning = false;
-              });
-
-              debugPrint("🎯 تم الاتصال! آيبي الكمبيوتر: $extractedIp");
-
-              if (isWifiSelected) {
-                // إذا كنا واي فاي، نغلق بورت الاستماع ونتصل ببورت 8888 للتحكم
-                await _serverSocket?.close();
-                socket.destroy();
-                await _connectTcp();
-              } else {
-                // إذا كنا USB، نحتفظ بهذا الاتصال للأوامر
-                _tcpSocket = socket;
-              }
-
-              startMonitor(); 
+      _udpSocket!.listen((RawSocketEvent event) {
+        if (event == RawSocketEvent.read && !isFound) {
+          Datagram? datagram = _udpSocket!.receive();
+          if (datagram != null) {
+            String message = utf8.decode(datagram.data).trim();
+            // إذا لقطنا نبضة الكمبيوتر
+            if (message == "PC_SERVER_HERE") {
+              isFound = true;
+              _udpSocket?.close();
+              String typeStr = isWifiSelected ? "الواي فاي" : "كيبل الـ USB";
+              _setConnectionSuccess(datagram.address.address, typeStr);
             }
-          },
-          onDone: () {
-            if (!isWifiSelected && mounted) {
-              setState(() {
-                connectionStatus = "انقطع الاتصال عبر الـ USB ✗";
-                statusColor = Colors.red;
-                _tcpSocket = null;
-              });
-            }
-          },
-          onError: (error) { debugPrint("خطأ: $error"); },
-        );
-      });
-
-      // مهلة 15 ثانية وتتوقف الدائرة عن الدوران إن لم يتصل الكمبيوتر
-      Future.delayed(const Duration(seconds: 15), () {
-        if (isScanning && !connected && mounted) {
-          setState(() {
-            isScanning = false;
-            String typeStr = isWifiSelected ? "الواي فاي" : "كيبل الـ USB";
-            connectionStatus = "لم يتم العثور على الكمبيوتر عبر $typeStr ✗\nتأكد من فتح البرنامج في الكمبيوتر.";
-            statusColor = Colors.red;
-          });
-          _serverSocket?.close();
+          }
         }
       });
 
+      // 3. ننتظر 3 ثواني، إذا ما وصل البث نعتبره فشل
+      await Future.delayed(const Duration(seconds: 3));
+      if (!isFound) {
+        _udpSocket?.close();
+        setState(() {
+          String typeStr = isWifiSelected ? "الواي فاي" : "كيبل الـ USB";
+          connectionStatus = "لم يتم العثور على الكمبيوتر عبر $typeStr ✗\nتأكد من تشغيل سكريبت الكمبيوتر.";
+          statusColor = Colors.red;
+          isScanning = false;
+        });
+      }
     } catch (e) {
-      debugPrint("❌ فشل فتح المنفذ 8080: $e");
-      if (!mounted) return;
       setState(() {
-        connectionStatus = "فشل تهيئة الاتصال: $e";
+        connectionStatus = "خطأ في البحث: $e";
         statusColor = Colors.red;
         isScanning = false;
       });
@@ -206,7 +191,7 @@ class _MainScreenState extends State<MainScreen> {
     _monitorTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
       try {
         final response = await http.get(Uri.parse('http://$deviceIp:5000/get_stats')).timeout(const Duration(seconds: 1));
-        if (response.statusCode == 200 && mounted) {
+        if (response.statusCode == 200) {
           final data = json.decode(response.body);
           setState(() {
             double cpu = double.tryParse(data['cpu']?.toString() ?? '0') ?? 0.0;
@@ -215,9 +200,7 @@ class _MainScreenState extends State<MainScreen> {
             ramUsage = ram.toStringAsFixed(1);
           });
         }
-      } catch (e) {
-        // يمكن إضافة debugPrint للخطأ إذا لزم الأمر
-      }
+      } catch (e) {}
     });
   }
 
@@ -226,11 +209,11 @@ class _MainScreenState extends State<MainScreen> {
   Future<void> syncApps() async {
     if (deviceIp.isEmpty) return; 
     setState(() => isSyncing = true);
-    final httpClient = HttpClient()..connectionTimeout = const Duration(seconds: 15);
     try {
       sendCommand("SYNC");
       await Future.delayed(const Duration(milliseconds: 1000));
       String url = 'http://$deviceIp:5000/get_all_data?t=${DateTime.now().millisecondsSinceEpoch}';
+      final httpClient = HttpClient()..connectionTimeout = const Duration(seconds: 15);
       final request = await httpClient.getUrl(Uri.parse(url));
       final response = await request.close().timeout(const Duration(seconds: 30)); 
 
@@ -239,7 +222,7 @@ class _MainScreenState extends State<MainScreen> {
         final data = json.decode(responseBody);
         String appsRaw = data['apps_raw'] ?? "";
         List<dynamic> icons = data['icons'] ?? [];
-        if (appsRaw.isNotEmpty && mounted) {
+        if (appsRaw.isNotEmpty) {
           List<String> appNames = appsRaw.split('|');
           List<Map<String, String>> fetchedApps = [];
           for (int i = 0; i < appNames.length; i++) {
@@ -256,15 +239,15 @@ class _MainScreenState extends State<MainScreen> {
             }
           }
           setState(() => customApps = fetchedApps);
-        } else if (mounted) {
+        } else {
           setState(() => customApps = []);
         }
       }
+      httpClient.close();
     } catch (e) {
       debugPrint("خطأ المزامنة: $e");
     } finally {
-      httpClient.close();
-      if (mounted) setState(() => isSyncing = false);
+      setState(() => isSyncing = false);
     }
   }
 
