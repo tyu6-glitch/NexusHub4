@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+}import 'package:flutter/material.dart';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:async';
@@ -57,7 +57,7 @@ class _MainScreenState extends State<MainScreen> {
   bool isSyncing = false;
 
   Socket? _tcpSocket;
-  RawDatagramSocket? _udpSocket; // 🌟 إضافة مقبس الـ UDP
+  ServerSocket? _serverSocket;
   bool isIosUsbMode = false; 
 
   Offset? _lastTouchPosition;
@@ -72,13 +72,16 @@ class _MainScreenState extends State<MainScreen> {
   void dispose() {
     _monitorTimer?.cancel();
     _tcpSocket?.close(); 
-    _udpSocket?.close(); // 🌟 إغلاق مقبس الـ UDP عند الخروج
+    _serverSocket?.close(); 
     super.dispose();
   }
 
-  Future<void> _connectTcp() async {
-    if (isIosUsbMode) return; 
+  // ==========================================
+  // منطق الاتصال (Wi-Fi & USB) المُحدث
+  // ==========================================
 
+  Future<void> _connectTcp() async {
+    if (isIosUsbMode) return; // في وضع الـ USB، السوكت يجينا جاهز من الكمبيوتر
     _tcpSocket?.close();
     if (deviceIp.isEmpty) return;
     try {
@@ -100,17 +103,144 @@ class _MainScreenState extends State<MainScreen> {
     } else {
       if (!isIosUsbMode) {
         _connectTcp().then((_) => _tcpSocket?.write("$command\n"));
-      } else {
-        debugPrint("الآيفون ينتظر اتصال الكمبيوتر أولاً لإرسال الأوامر!");
       }
     }
   }
 
-  // 🌟 دالة مساعدة لترتيب حالة النجاح وتفادي تكرار الكود
-  void _setConnectionSuccess(String ip, String connectionType) async {
+  // 1. سيرفر الـ USB (يفتح منفذ 8080 وينتظر سلك usbmuxd)
+  Future<void> _startIosUsbServer() async {
+    try {
+      _serverSocket?.close();
+      _tcpSocket?.close();
+
+      _serverSocket = await ServerSocket.bind(InternetAddress.anyIPv4, 8080);
+      debugPrint("📱 التطبيق جاهز وينتظر دخول الكمبيوتر عبر السلك على منفذ 8080...");
+
+      _serverSocket!.listen((Socket socket) {
+        debugPrint("✅ الكمبيوتر كسر الباب ودخل عبر السلك بنجاح! 🚀");
+
+        socket.listen(
+          (List<int> data) {
+            String message = utf8.decode(data).trim();
+            // الكمبيوتر سيرسل الآيبي الوهمي الخاص بنفق الـ USB (مثل 192.168.x.x)
+            if (message.startsWith("PC_IP:")) {
+              setState(() {
+                deviceIp = message.split(":")[1]; 
+                _tcpSocket = socket; // نثبت السوكت عشان نرسل الماوس والكيبورد من خلاله
+                connectionStatus = "تم الاتصال الخارق عبر سلك الـ USB ✓";
+                statusColor = Colors.green;
+                isScanning = false;
+              });
+              debugPrint("🎯 استلمنا آيبي السلك: $deviceIp");
+              startMonitor(); 
+            }
+          },
+          onDone: () {
+            setState(() {
+              connectionStatus = "تم فصل سلك الـ USB ✗";
+              statusColor = Colors.red;
+              _tcpSocket = null;
+            });
+            socket.destroy();
+          },
+          onError: (error) {
+            setState(() {
+              connectionStatus = "خطأ في السلك ✗";
+              statusColor = Colors.red;
+              _tcpSocket = null;
+            });
+            socket.destroy();
+          },
+        );
+      });
+    } catch (e) {
+      setState(() {
+        connectionStatus = "فشل فتح منفذ الـ USB: $e";
+        statusColor = Colors.red;
+        isScanning = false;
+      });
+    }
+  }
+
+  // 2. رادار الواي فاي (UDP Broadcast) للبحث اللحظي
+  Future<void> _scanWifiRadar() async {
+    String? foundIp;
+    try {
+      RawDatagramSocket udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      udpSocket.broadcastEnabled = true;
+      
+      udpSocket.listen((RawSocketEvent event) {
+        if (event == RawSocketEvent.read) {
+          Datagram? dg = udpSocket.receive();
+          if (dg != null) {
+            String msg = utf8.decode(dg.data).trim();
+            if (msg.startsWith("SHADOWHUB_PC:")) {
+              foundIp = msg.split(":")[1];
+              if (deviceIp.isEmpty && mounted) {
+                _onDeviceFound(foundIp!, "الواي فاي (رادار سريع) 📶");
+              }
+              udpSocket.close();
+            }
+          }
+        }
+      });
+
+      // نصرخ في الشبكة: "أين الكمبيوتر؟"
+      udpSocket.send(utf8.encode("SHADOWHUB_IPAD"), InternetAddress("255.255.255.255"), 5005);
+      
+      // ننتظر ثانية، إذا ما رد الرادار نستخدم طريقة الفحص العادية (Fallback)
+      await Future.delayed(const Duration(milliseconds: 1500));
+      udpSocket.close();
+    } catch (e) {
+      debugPrint("خطأ في الرادار: $e");
+    }
+
+    // إذا الرادار ما لقط شيء، نسوي مسح سريع للمنافذ (HTTP)
+    if (deviceIp.isEmpty) {
+      try {
+        final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv4, includeLinkLocal: false);
+        for (var interface in interfaces) {
+          String name = interface.name.toLowerCase();
+          if (!(name.startsWith('wlan') || name == 'en0' || name.startsWith('wifi'))) continue;
+
+          for (var addr in interface.addresses) {
+            if (addr.address.startsWith('127.')) continue;
+            String subnet = addr.address.substring(0, addr.address.lastIndexOf('.'));
+            
+            List<Future<void>> scanTasks = [];
+            for (int i = 1; i <= 255; i++) {
+              String targetIp = '$subnet.$i';
+              scanTasks.add(
+                http.get(Uri.parse('http://$targetIp:5000/get_stats'))
+                    .timeout(const Duration(milliseconds: 1000))
+                    .then((response) {
+                  if (response.statusCode == 200 && foundIp == null) {
+                    foundIp = targetIp; 
+                    _onDeviceFound(foundIp!, "الواي فاي (فحص يدوي) 📶");
+                  }
+                }).catchError((_) {}) 
+              );
+            }
+            await Future.wait(scanTasks);
+            if (deviceIp.isNotEmpty) return;
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (deviceIp.isEmpty && mounted) {
+      setState(() {
+        connectionStatus = "لم يتم العثور على الكمبيوتر عبر الواي فاي ✗";
+        statusColor = Colors.red;
+        isScanning = false;
+      });
+    }
+  }
+
+  void _onDeviceFound(String ip, String type) async {
     setState(() {
       deviceIp = ip;
-      connectionStatus = "تم الاتصال بنجاح عبر $connectionType ✓";
+      connectionStatus = "تم الاتصال بنجاح عبر $type ✓";
       statusColor = Colors.green;
       isScanning = false;
     });
@@ -118,71 +248,35 @@ class _MainScreenState extends State<MainScreen> {
     await _connectTcp();
   }
 
-  // 🌟 التعديل الجذري هنا: الاستماع لـ UDP بدل البحث العشوائي
+  // الزر الرئيسي للبحث والاتصال
   Future<void> autoDiscoverPC() async {
     setState(() {
       isScanning = true;
       deviceIp = ""; 
-      isIosUsbMode = false; // تم توحيد الاتصال الآن فلا نحتاج لوضع الآيفون المعقد
-      String typeStr = isWifiSelected ? "الواي فاي 📶" : "كيبل الـ USB 🔗";
-      connectionStatus = "جاري البحث عن الكمبيوتر عبر $typeStr ⏳...";
-      statusColor = Colors.orange;
     });
 
-    _udpSocket?.close();
-    bool isFound = false;
-
-    // 1. الفحص السريع عبر Localhost (لبعض حالات الأندرويد عبر ADB)
     if (!isWifiSelected) {
-      try {
-        final response = await http.get(Uri.parse('http://127.0.0.1:5000/get_stats')).timeout(const Duration(milliseconds: 1000));
-        if (response.statusCode == 200) {
-          _setConnectionSuccess('127.0.0.1', "كيبل الـ USB (مباشر)");
-          return;
-        }
-      } catch (_) {}
-    }
-
-    // 2. الاستماع لبث البايثون (UDP Broadcast) على البورت 5555
-    try {
-      _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 5555);
-      _udpSocket!.broadcastEnabled = true;
-
-      _udpSocket!.listen((RawSocketEvent event) {
-        if (event == RawSocketEvent.read && !isFound) {
-          Datagram? datagram = _udpSocket!.receive();
-          if (datagram != null) {
-            String message = utf8.decode(datagram.data).trim();
-            // إذا لقطنا نبضة الكمبيوتر
-            if (message == "PC_SERVER_HERE") {
-              isFound = true;
-              _udpSocket?.close();
-              String typeStr = isWifiSelected ? "الواي فاي" : "كيبل الـ USB";
-              _setConnectionSuccess(datagram.address.address, typeStr);
-            }
-          }
-        }
-      });
-
-      // 3. ننتظر 3 ثواني، إذا ما وصل البث نعتبره فشل
-      await Future.delayed(const Duration(seconds: 3));
-      if (!isFound) {
-        _udpSocket?.close();
-        setState(() {
-          String typeStr = isWifiSelected ? "الواي فاي" : "كيبل الـ USB";
-          connectionStatus = "لم يتم العثور على الكمبيوتر عبر $typeStr ✗\nتأكد من تشغيل سكريبت الكمبيوتر.";
-          statusColor = Colors.red;
-          isScanning = false;
-        });
-      }
-    } catch (e) {
+      // وضع الـ USB فقط
       setState(() {
-        connectionStatus = "خطأ في البحث: $e";
-        statusColor = Colors.red;
-        isScanning = false;
+        isIosUsbMode = true;
+        connectionStatus = "جاري انتظار الكمبيوتر عبر منفذ الـ USB ⏳...\n(يرجى تشغيل السكربت في الكمبيوتر)";
+        statusColor = Colors.orange;
       });
+      await _startIosUsbServer();
+    } else {
+      // وضع الواي فاي
+      setState(() {
+        isIosUsbMode = false;
+        connectionStatus = "جاري البحث بالرادار عبر الواي فاي 📶...";
+        statusColor = Colors.orange;
+      });
+      await _scanWifiRadar();
     }
   }
+
+  // ==========================================
+  // باقي الكود ووظائف التطبيق كما هي دون المساس بها
+  // ==========================================
 
   void startMonitor() {
     _monitorTimer?.cancel();
